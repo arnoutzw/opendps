@@ -54,6 +54,7 @@
 #include "protocol.h"
 #include "uframe.h"
 #include "hexdump.h"
+#include "webserver.h"
 
 /** User friendly FreeRTOS delay macro */
 #define delay_ms(ms) vTaskDelay(ms / portTICK_PERIOD_MS)
@@ -61,6 +62,9 @@
 
 /** Semaphore to signal wifi availability */
 static SemaphoreHandle_t wifi_alive_sem;
+
+/** Mutex for UART access */
+static SemaphoreHandle_t uart_mutex;
 
 /** A queue to synchronize UART comms */
 static QueueHandle_t tx_queue;
@@ -161,6 +165,38 @@ static uint32_t uart_rx_frame(uint8_t *buffer, uint32_t buffer_size)
 }
 
 /**
+  * @brief Synchronous UART communication for webserver
+  * Sends frame and receives response
+  * @param frame In: frame to send, Out: response frame
+  * @retval true on success, false on timeout
+  */
+static bool uart_comm_sync(frame_t *frame)
+{
+    bool success = false;
+    uint8_t rx_buffer[MAX_FRAME_LENGTH];
+    uint32_t rx_size;
+
+    if (xSemaphoreTake(uart_mutex, 1000/portTICK_PERIOD_MS) == pdTRUE) {
+        // Send frame
+        uart_tx((uint8_t*)frame->buffer, frame->length);
+
+        // Receive response
+        rx_size = uart_rx_frame(rx_buffer, sizeof(rx_buffer));
+        if (rx_size > 0) {
+            // Extract payload from response
+            int32_t payload_len = uframe_extract_payload(frame, rx_buffer, rx_size);
+            if (payload_len > 0) {
+                success = true;
+            }
+        }
+
+        xSemaphoreGive(uart_mutex);
+    }
+
+    return success;
+}
+
+/**
   * @brief Set wifi status in the DPS
   * @param status guess :)
   * @retval None
@@ -233,28 +269,31 @@ static void uart_comm_task(void *arg)
             printf("xQueueReceive failed\n");
             delay_ms(1000);
         } else {
-            uint8_t buffer[MAX_FRAME_LENGTH];
-            uint32_t size;
-            uart_tx((uint8_t*) &item.frame, item.frame.length);
+            if (xSemaphoreTake(uart_mutex, 1000/portTICK_PERIOD_MS) == pdTRUE) {
+                uint8_t buffer[MAX_FRAME_LENGTH];
+                uint32_t size;
+                uart_tx((uint8_t*) &item.frame, item.frame.length);
 
-            size = uart_rx_frame((uint8_t*) &buffer, sizeof(buffer));
-            if (size > 0) {
-                if (item.client_port > 0) {
-                    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, size, PBUF_RAM);
-                    if (!p) {
-                        printf("Failed to allocate transport buffer\n");
-                    } else {
-                        memcpy(p->payload, buffer, size);
-                        err_t err = udp_sendto(item.upcb, p, &item.client_addr, item.client_port);
-                        if (err < 0) {
-                            printf("Error sending message: %s (%d)\n", lwip_strerr(err), err);
+                size = uart_rx_frame((uint8_t*) &buffer, sizeof(buffer));
+                if (size > 0) {
+                    if (item.client_port > 0) {
+                        struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, size, PBUF_RAM);
+                        if (!p) {
+                            printf("Failed to allocate transport buffer\n");
+                        } else {
+                            memcpy(p->payload, buffer, size);
+                            err_t err = udp_sendto(item.upcb, p, &item.client_addr, item.client_port);
+                            if (err < 0) {
+                                printf("Error sending message: %s (%d)\n", lwip_strerr(err), err);
+                            }
+                            pbuf_free(p);
                         }
-                        pbuf_free(p);
                     }
+                } else {
+                    printf("Timeout from DPS\n");
+                    /** @todo: handle timeout */
                 }
-            } else {
-                printf("Timeout from DPS\n");
-                /** @todo: handle timeout */
+                xSemaphoreGive(uart_mutex);
             }
         }
     }
@@ -329,9 +368,12 @@ void user_init(void)
     uart_set_baud(0, CONFIG_BAUDRATE);  /** Baudrate set in makefile */
     uart_clear_txfifo(0);
     vSemaphoreCreateBinary(wifi_alive_sem);
+    uart_mutex = xSemaphoreCreateMutex();
     tx_queue = xQueueCreate(TX_QUEUE_DEPTH, sizeof(tx_item_t));
     ota_tftp_init_server(TFTP_PORT);
+    webserver_init(uart_comm_sync);
     xTaskCreate(&uart_comm_task, "uart_comm_task", 2048, NULL, 4, NULL);
     xTaskCreate(&wifi_task, "wifi_task",  256, NULL, 2, NULL);
     xTaskCreate(&uhej_task, "uhej_task",  256, NULL, 3, NULL);
+    xTaskCreate(&webserver_task, "webserver_task", 2048, NULL, 3, NULL);
 }
